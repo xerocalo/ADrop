@@ -158,6 +158,9 @@ class History:
                 continue
             state = self.inspect(job, entry)
             if state != "복원 가능":
+                entry["undo_result"] = state
+                entry["undo_ended"] = now()
+                self.save(job)
                 results.append(state)
                 continue
             source, destination = Path(entry["source"]), Path(entry["destination"])
