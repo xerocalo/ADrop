@@ -10,6 +10,7 @@ from tkinter import filedialog, ttk, messagebox
 from .analyzer import AnalysisResult, Progress
 from .paths import default_downloads
 from .organizer import preview, execute, quarantine_directory
+from .history import History, configure_logging
 
 
 def human_size(value: int) -> str:
@@ -49,6 +50,7 @@ class OrganizerApp:
         ttk.Button(actions, text="선택 파일을 중복 보존본으로", command=self.keep_selected).pack(side="left", padx=8)
         self.organize_button = ttk.Button(actions, text="선택 파일 정리…", command=self.organize, state="disabled")
         self.organize_button.pack(side="left")
+        ttk.Button(actions, text="작업 이력 / 복원 / 격리 관리", command=self.history_window).pack(side="left", padx=8)
         ttk.Label(root, textvariable=self.status, padding=10, wraplength=1150).pack(fill="x")
         self.bar = ttk.Progressbar(root, maximum=100)
         self.bar.pack(fill="x", padx=10)
@@ -218,6 +220,84 @@ class OrganizerApp:
             result = Outcome(errors=[str(exc)])
         self.events.put(("done", result))
 
+    def history_window(self):
+        if self.busy:
+            return
+        store = History()
+        window = tk.Toplevel(self.root)
+        window.title("작업 이력 — 복원 및 격리 관리")
+        window.geometry("1050x650")
+        window.grab_set()
+        active = [False]
+        window.protocol("WM_DELETE_WINDOW", lambda: None if active[0] else window.destroy())
+        jobs = store.list()
+        job_list = tk.Listbox(window, height=7)
+        job_list.pack(fill="x")
+        for job in jobs:
+            job_list.insert("end", f"{job['id']} | {job.get('started', '')} | {job['state']}" + (" (중단 감지)" if job.get("state") == "running" else ""))
+        summary = tk.StringVar(value="작업을 선택하세요. Manifest가 없으면 복원 기록을 확인할 수 없습니다.")
+        ttk.Label(window, textvariable=summary, wraplength=1000).pack(fill="x")
+        table = ttk.Treeview(window, columns=("from", "to", "state"), show="headings", selectmode="extended")
+        for key, label in (("from", "복원할 원본 위치"), ("to", "현재 보관 위치"), ("state", "복구 상태")):
+            table.heading(key, text=label)
+            table.column(key, width=340)
+        table.pack(fill="both", expand=True)
+        current = [None]
+
+        def refresh(event=None):
+            if not job_list.curselection():
+                return
+            job = jobs[job_list.curselection()[0]]
+            current[0] = job
+            table.delete(*table.get_children())
+            size = 0
+            count = 0
+            for index, entry in enumerate(job["entries"]):
+                state = store.inspect(job, entry)
+                table.insert("", "end", iid=str(index), values=(entry.get("source", "?"), entry.get("destination", "?"), state))
+                if entry.get("kind") == "quarantine" and Path(entry.get("destination", "")).is_file():
+                    count += 1
+                    size += Path(entry["destination"]).stat().st_size
+            summary.set(f"작업별 격리 {count}개 / {human_size(size)} | {job.get('errors', '')} | 행 선택 후 복원/삭제하세요. 중단 기록은 현재 파일을 검증해 표시합니다.")
+
+        def run(delete=False):
+            job = current[0]
+            indices = [int(i) for i in table.selection()]
+            if not job or not indices:
+                return
+            preview_text = "\n".join(f"{job['entries'][i]['destination']} → {job['entries'][i]['source']} | {store.inspect(job, job['entries'][i])}" for i in indices)
+            warning = "영구 삭제한 파일은 되돌릴 수 없습니다! 선택한 격리 파일만 삭제합니다." if delete else "복원 미리보기 — 원본 위치 충돌/내용 변경 파일은 건너뜁니다."
+            if not messagebox.askokcancel("영구 삭제 최종 확인" if delete else "복원 미리보기 및 최종 확인", warning + "\n" + preview_text, parent=window, default="cancel"):
+                return
+            def work():
+                try:
+                    result = store.purge(job, indices, confirmed=True) if delete else store.restore(job, indices=indices, confirmed=True)
+                    queue.put("\n".join(result))
+                except Exception as exc:
+                    queue.put(str(exc))
+            queue = Queue()
+            active[0] = True
+            job_list.configure(state="disabled")
+            controls.pack_forget()
+            Thread(target=work, daemon=False).start()
+            def poll():
+                try:
+                    result = queue.get_nowait()
+                except Empty:
+                    window.after(100, poll)
+                    return
+                active[0] = False
+                job_list.configure(state="normal")
+                refresh()
+                summary.set(result)
+                controls.pack(fill="x")
+            window.after(100, poll)
+        job_list.bind("<<ListboxSelect>>", refresh)
+        controls = ttk.Frame(window)
+        controls.pack(fill="x")
+        ttk.Button(controls, text="선택 항목 복원…", command=run).pack(side="left")
+        ttk.Button(controls, text="선택 격리 파일 영구 삭제…", command=lambda: run(True)).pack(side="left")
+
     def log(self, text):
         self.messages.configure(state="normal")
         self.messages.delete("1.0", "end")
@@ -235,6 +315,7 @@ class OrganizerApp:
 
 
 def main():
+    configure_logging()
     root = tk.Tk()
     OrganizerApp(root)
     root.mainloop()

@@ -10,6 +10,7 @@ import os
 import uuid
 
 from .analyzer import FilePlan, _linked, analyze
+from .history import History, ManifestError, now, log_event
 
 CHUNK = 1024 * 1024
 
@@ -128,6 +129,7 @@ def equal_files(a, b, cancel=None):
 
 
 def preview(folder, basis="created", *, scope=None, progress=None, cancel=None):
+    log_event(f"파일 분석/중복 검사 시작: {folder}")
     root = Path(os.path.abspath(folder))
     scope = Path(os.path.abspath(scope or Path.home()))
     result = Preview(root, scope)
@@ -240,17 +242,22 @@ def remove_source(path, protected):
             raise ctypes.WinError(ctypes.get_last_error())
 
 
-def execute(prepared: Preview, *, confirmed: bool, quarantine=None, cancel=None):
+def execute(prepared: Preview, *, confirmed: bool, quarantine=None, cancel=None, history=None):
     outcome = Outcome()
     if not confirmed or prepared.cancelled:
         return outcome
     quarantine = Path(quarantine or quarantine_directory()).absolute()
+    history = history or History(quarantine.parent if quarantine is not None else None)
+    job = history.create(prepared.root, quarantine)
+    job["scope"] = str(prepared.scope)
+    log_event(f"정리 시작: {job['id']}")
     items = [i for i in prepared.items if i.selected]
     # 격리 전에 보존본을 검증할 수 있도록 중복부터 처리한다.
     items.sort(key=lambda i: not prepared.duplicate(i))
     for item in items:
         if cancel and cancel.is_set():
             break
+        entry = None
         destination = None
         created_target = False
         stack = ExitStack()
@@ -286,6 +293,10 @@ def execute(prepared: Preview, *, confirmed: bool, quarantine=None, cancel=None)
             safe_path(destination)
             if os.path.lexists(destination):
                 raise FileExistsError(f"이름 충돌: {destination}")
+            entry = dict(source=str(source), destination=str(destination), size=item.plan.size,
+                         hash=expected, kind="quarantine" if duplicate else "move", status="planned")
+            job["entries"].append(entry)
+            history.save(job)
             destination.parent.mkdir(parents=True, exist_ok=True)
             safe_path(destination.parent)
             if duplicate:
@@ -318,14 +329,26 @@ def execute(prepared: Preview, *, confirmed: bool, quarantine=None, cancel=None)
             if signature(source.lstat()) != item.snapshot:
                 raise ValueError("작업 직전 원본 변경 감지")
             remove_source(source, protected)
+            created_target = False
             (outcome.quarantined if duplicate else outcome.moved).append(str(destination))
+            entry["status"] = "completed"
+            history.save(job)
         except (OSError, ValueError, StopIteration) as exc:
             outcome.errors.append(f"{item.plan.source}: {exc}")
+            log_event(outcome.errors[-1])
+            if entry is not None:
+                entry["error"] = str(exc)
             if created_target and destination is not None:
                 try:
                     destination.unlink()
                 except OSError as cleanup:
                     outcome.errors.append(f"부분 복사본 정리 실패 {destination}: {cleanup}")
+            if isinstance(exc, ManifestError):
+                raise
         finally:
             stack.close()
+    job["ended"] = now()
+    job["state"] = "finished"
+    history.save(job)
+    log_event(f"정리 종료: {job['id']}")
     return outcome
