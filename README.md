@@ -12,7 +12,7 @@ python -m download_organizer
 python -m pytest -v
 ```
 
-GitHub Actions의 `Windows tests and EXE`는 Python 3.12 테스트와 PyInstaller 빌드 후 `DownloadOrganizer-Windows` 아티팩트를 제공합니다. 아티팩트를 내려받아 압축을 풀고 `DownloadOrganizer.exe`를 실행합니다. PC 로컬 개발환경은 필요하지 않습니다. EXE는 아직 코드 서명되지 않았습니다.
+GitHub Actions의 `Build Windows EXE`는 Python 3.12 테스트와 PyInstaller 빌드 후 `DownloadOrganizer-Windows` 아티팩트를 제공합니다. 아티팩트를 내려받아 압축을 풀고 `DownloadOrganizer.exe`를 실행합니다. PC 로컬 개발환경은 필요하지 않습니다. EXE는 아직 코드 서명되지 않았습니다.
 
 ```powershell
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name DownloadOrganizer --paths src src/download_organizer/launcher.py
@@ -67,7 +67,7 @@ tests/
   test_analyzer.py # 읽기 전용 분석 테스트
   test_organizer.py # 임시 폴더 기반 중복·이동·격리·변경 보호 테스트
   test_gui.py      # GUI 분석·오류 복구·최종 확인 취소 테스트
-.github/workflows/windows.yml # Windows 테스트·EXE 빌드·아티팩트 배포
+.github/workflows/build.yml # Windows 테스트·EXE 빌드·아티팩트 배포
 pyproject.toml
 ```
 
@@ -90,3 +90,17 @@ Windows 10/11에서 EXE 및 공유 잠금·장경로 수동 검증, 사용자별
 ### 데이터 손실 위험과 대응
 
 Manifest나 디스크 자체가 손상되면 자동 Undo를 보장할 수 없습니다. 앱 데이터와 작업 파일을 별도 백업하세요. 파일이 사후 변경되거나 원래 경로가 사용 중이면 자동 덮어쓰기하지 않으며 사용자가 충돌 파일을 별도 위치에 보관한 뒤 다시 시도해야 합니다. 강제 종료/전원 차단 시 양쪽에 파일이 남거나 계획 상태로 남을 수 있으므로 이력에서 상태를 확인하고, 양쪽 파일은 수동 검증 전 삭제하지 마세요. 영구 삭제 전 외부 백업을 권장합니다. Manifest는 인증 서명된 보안 경계가 아니므로 신뢰할 수 없는 사람이 수정한 기록을 사용하지 마세요. Windows 저장 장치의 캐시·하드웨어 고장에 대한 절대적 내구성은 보장하지 않습니다.
+
+
+## GitHub Actions에서 EXE 빌드 및 다운로드
+
+워크플로 파일은 `.github/workflows/build.yml`입니다. 기존 Windows 워크플로를 이 파일로 통합했습니다.
+
+1. 변경사항을 기본 브랜치에 병합합니다. `main` 또는 현재 저장소의 `Main` 브랜치에 push하면 자동 실행하며 해당 브랜치로 향하는 PR에서도 실행합니다.
+2. 수동 실행은 GitHub 저장소의 **Actions → Build Windows EXE → Run workflow**에서 브랜치를 선택합니다. GitHub가 수동 실행 버튼을 표시하려면 먼저 워크플로가 기본 브랜치에 존재해야 합니다. Actions 실행 권한도 필요합니다.
+3. Windows runner에서 **Python 3.12 x64**를 설치하고 `python -m pip install -e ".[dev]"` 및 `pip check`를 실행합니다. 이 프로젝트의 런타임은 Python 표준 라이브러리를 사용하며 `dev`에는 pytest와 PyInstaller가 포함됩니다.
+4. pytest가 성공해야 PyInstaller 빌드로 진행합니다. 진입점은 실제 파일 `src/download_organizer/launcher.py`이며 `download_organizer.gui.main`을 호출합니다. `--paths src`로 src 패키지를 찾고 `--onefile --windowed`로 콘솔 없는 단일 `dist/DownloadOrganizer.exe`를 만듭니다.
+5. 성공한 실행 화면 하단 **Artifacts → DownloadOrganizer-Windows**를 다운로드해 ZIP을 풀고 `DownloadOrganizer.exe`를 실행합니다. GitHub 로그인과 저장소 접근 권한이 필요하며 보관 기간은 14일입니다.
+6. 실패 시 실행 화면의 실패한 단계 로그와 **DownloadOrganizer-build-logs** 아티팩트를 확인합니다. 설치 로그, 패키지 버전, pytest 로그/JUnit 결과, PyInstaller 로그·경고·분석 결과 및 성공 시 EXE SHA-256을 제공합니다. 체크아웃/런타임 설치 단계에서 실패하면 아직 생성되지 않은 로그는 포함되지 않을 수 있습니다.
+
+워크플로는 실제 경로와 진입점 import를 확인하고, 생성된 EXE의 PE 헤더에서 x64 및 Windows GUI 서브시스템을 검증합니다. 이는 패키징 검증이며 **빌드된 EXE의 창이 열리는지나 실제 Windows 10/11 화면에서의 사용성 검증을 대신하지 않습니다.** pytest는 Python 소스의 Tk GUI 테스트를 수행합니다. EXE를 실행한 화면 확인과 실제 다운로드 폴더의 권한·잠금 환경 검증은 별도 Windows 테스트가 필요합니다. 실행 파일은 아직 서명되지 않았습니다.
