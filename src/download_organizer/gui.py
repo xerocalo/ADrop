@@ -5,10 +5,11 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from time import monotonic
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 
-from .analyzer import AnalysisResult, Progress, analyze
+from .analyzer import AnalysisResult, Progress
 from .paths import default_downloads
+from .organizer import preview, execute, quarantine_directory
 
 
 def human_size(value: int) -> str:
@@ -18,15 +19,17 @@ def human_size(value: int) -> str:
 class OrganizerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Download Organizer — 읽기 전용 분석")
+        root.title("Download Organizer — 미리보기 및 정리")
         root.geometry("1200x720")
         self.events: Queue = Queue()
         self.cancel = Event()
         self.busy = False
         self.closed = False
+        self.prepared = None
+        self.row_items = {}
         self.path = tk.StringVar(value=str(default_downloads()))
-        self.basis = tk.StringVar(value="수정일")
-        self.status = tk.StringVar(value="파일을 이동하거나 삭제하지 않습니다. 폴더를 선택하고 분석하세요.")
+        self.basis = tk.StringVar(value="생성일")
+        self.status = tk.StringVar(value="분석은 읽기 전용이며 정리는 최종 확인 후 실행됩니다. 폴더를 선택하세요.")
         controls = ttk.Frame(root, padding=10)
         controls.pack(fill="x")
         ttk.Label(controls, text="분석 폴더").pack(side="left")
@@ -40,6 +43,12 @@ class OrganizerApp:
         self.start_button.pack(side="left")
         self.cancel_button = ttk.Button(controls, text="취소", command=self.cancel.set, state="disabled")
         self.cancel_button.pack(side="left", padx=8)
+        actions = ttk.Frame(root, padding=6)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="선택 행 처리 여부 전환", command=self.toggle).pack(side="left")
+        ttk.Button(actions, text="선택 파일을 중복 보존본으로", command=self.keep_selected).pack(side="left", padx=8)
+        self.organize_button = ttk.Button(actions, text="선택 파일 정리…", command=self.organize, state="disabled")
+        self.organize_button.pack(side="left")
         ttk.Label(root, textvariable=self.status, padding=10, wraplength=1150).pack(fill="x")
         self.bar = ttk.Progressbar(root, maximum=100)
         self.bar.pack(fill="x", padx=10)
@@ -48,7 +57,7 @@ class OrganizerApp:
         columns = ("name", "size", "created", "modified", "source", "destination", "warning")
         self.table = ttk.Treeview(frame, columns=columns, show="headings")
         for key, label, width in zip(columns,
-                ("파일명", "용량(bytes)", "생성일", "수정일", "이동 전 경로", "이동 후 예상 경로", "주의"),
+                ("파일명", "용량(bytes)", "생성일", "수정일", "이동 전 경로", "이동 후 예상 경로", "처리 / 중복 / 주의"),
                 (180, 110, 150, 150, 360, 420, 240)):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, stretch=False)
@@ -73,6 +82,7 @@ class OrganizerApp:
 
     def set_busy(self, value: bool):
         self.busy = value
+        self.organize_button.configure(state="disabled" if value or self.prepared is None else "normal")
         for widget in (self.path_entry, self.choose_button, self.start_button):
             widget.configure(state="disabled" if value else "normal")
         self.date_combo.configure(state="disabled" if value else "readonly")
@@ -81,6 +91,8 @@ class OrganizerApp:
     def start(self):
         if self.busy:
             return
+        self.prepared = None
+        self.row_items.clear()
         self.set_busy(True)
         self.cancel.clear()
         self.table.delete(*self.table.get_children())
@@ -102,7 +114,7 @@ class OrganizerApp:
                 self.events.put(("progress", event))
                 last = now
         try:
-            result = analyze(folder, basis, progress=update, cancel=self.cancel)
+            result = preview(folder, basis, progress=update, cancel=self.cancel)
         except Exception as exc:
             result = AnalysisResult(errors=[f"분석 오류: {exc}"])
         self.events.put(("result", result))
@@ -117,6 +129,12 @@ class OrganizerApp:
                     self.bar.stop()
                     self.bar.configure(mode="determinate", value=event.processed / max(event.total, 1) * 100)
                     self.status.set(f"항목 {event.processed:,}/{event.total:,} · 분석 파일 {event.files:,}개 · {human_size(event.bytes)}")
+                elif kind == "done":
+                    self.bar.stop()
+                    self.status.set(f"작업 완료 · 이동 {len(event.moved)}개 · 격리 {len(event.quarantined)}개 · 오류/건너뜀 {len(event.errors)}개. 다시 분석하세요.")
+                    self.log("\n".join(event.errors))
+                    self.prepared = None
+                    self.set_busy(False)
                 else:
                     self.bar.stop()
                     self.bar.configure(mode="determinate")
@@ -131,7 +149,9 @@ class OrganizerApp:
         def date(value: datetime | None):
             return value.strftime("%Y-%m-%d %H:%M:%S") if value else "제공되지 않음"
         for plan in result.plans[offset:offset + 150]:
-            self.table.insert("", "end", values=(plan.source.name, f"{plan.size:,}", date(plan.created), date(plan.modified), str(plan.source), str(plan.destination), plan.warning))
+            row = self.table.insert("", "end", values=(plan.source.name, f"{plan.size:,}", date(plan.created), date(plan.modified), str(plan.source), str(plan.destination), plan.warning))
+            if hasattr(result, "items"):
+                self.row_items[row] = result.items[len(self.row_items)]
         offset += 150
         if offset < len(result.plans):
             self.status.set(f"분석 결과 표시 중… {min(offset, len(result.plans)):,}/{len(result.plans):,}")
@@ -140,7 +160,63 @@ class OrganizerApp:
         self.bar.configure(value=0 if result.cancelled or (result.errors and not result.plans) else 100)
         self.status.set(f"{'취소됨(부분 결과)' if result.cancelled else '분석 종료'} · 파일 {len(result.plans):,}개 · {human_size(result.total_bytes)} · 제외 {len(result.skipped):,}개 · 오류 {len(result.errors):,}개 · 실제 변경 없음")
         self.log("\n".join([*(f"오류: {e}" for e in result.errors), *(f"제외: {s}" for s in result.skipped)]))
+        self.prepared = result if hasattr(result, "items") and not result.cancelled else None
         self.set_busy(False)
+        self.refresh_rows()
+
+    def refresh_rows(self):
+        if not self.prepared:
+            return
+        for row, item in self.row_items.items():
+            duplicate = self.prepared.duplicate(item)
+            label = "중복 격리" if duplicate else ("중복 보존" if item.group else "날짜 이동")
+            self.table.set(row, "warning", f"{'처리' if item.selected else '제외'} / {label} / {item.plan.warning}")
+            self.table.set(row, "destination", str(quarantine_directory() / "<고유ID>" / "files" / item.plan.source.name) if duplicate else str(item.plan.destination))
+        count, duplicates, size = self.prepared.summary()
+        self.status.set(f"파일 {len(self.prepared.items)}개 · 오류 {len(self.prepared.errors)}개 · 정리 대상 {count}개 · 중복 격리 {duplicates}개 · 중복 예상 용량 {human_size(size)} (격리는 디스크 여유 공간을 늘리지 않습니다)")
+
+    def toggle(self):
+        if self.busy or not self.prepared:
+            return
+        for row in self.table.selection():
+            item = self.row_items[row]
+            if item.valid:
+                item.selected = not item.selected
+        self.refresh_rows()
+
+    def keep_selected(self):
+        if self.busy or not self.prepared:
+            return
+        rows = self.table.selection()
+        if len(rows) == 1:
+            self.prepared.keep(self.row_items[rows[0]].plan.source)
+            self.refresh_rows()
+
+    def organize(self):
+        if self.busy or not self.prepared:
+            return
+        count, duplicates, size = self.prepared.summary()
+        if not count:
+            return
+        destinations = sorted({str(i.plan.destination.parent) for i in self.prepared.items if i.selected and not self.prepared.duplicate(i)})
+        text = (f"실제 처리 {count}개 (날짜 이동 {count - duplicates}개, 중복 격리 {duplicates}개)\n"
+                f"중복 예상 용량: {human_size(size)}\n격리로 디스크 여유 공간은 증가하지 않습니다.\n"
+                f"이동 목적지:\n" + "\n".join(destinations) + f"\n격리: {quarantine_directory()}\n실행할까요?")
+        if not messagebox.askokcancel("파일 정리 최종 확인", text, parent=self.root, default="cancel"):
+            return
+        self.cancel.clear()
+        self.set_busy(True)
+        self.bar.configure(mode="indeterminate")
+        self.bar.start(20)
+        Thread(target=self.execute_work, args=(self.prepared,), daemon=False).start()
+
+    def execute_work(self, prepared):
+        from .organizer import Outcome
+        try:
+            result = execute(prepared, confirmed=True, cancel=self.cancel)
+        except Exception as exc:
+            result = Outcome(errors=[str(exc)])
+        self.events.put(("done", result))
 
     def log(self, text):
         self.messages.configure(state="normal")
@@ -149,6 +225,10 @@ class OrganizerApp:
         self.messages.configure(state="disabled")
 
     def close(self):
+        if self.busy:
+            self.cancel.set()
+            self.status.set("취소 요청됨. 작업 종료 후 창을 닫으세요.")
+            return
         self.closed = True
         self.cancel.set()
         self.root.destroy()

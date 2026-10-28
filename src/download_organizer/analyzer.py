@@ -21,6 +21,7 @@ class FilePlan:
     created: datetime | None
     modified: datetime
     warning: str = ""
+    snapshot: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,7 @@ def analyze(folder: Path, basis: DateBasis = "modified", *,
                         warning = "예상 대상 폴더가 링크 또는 일반 파일입니다."
                     elif os.path.lexists(destination):
                         warning = "예상 대상에 같은 이름이 있습니다."
-                result.plans.append(FilePlan(path, destination, info.st_size, created, modified, warning))
+                result.plans.append(FilePlan(path, destination, info.st_size, created, modified, warning, (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)))
                 size += info.st_size
         except (OSError, ValueError, OverflowError) as exc:
             result.errors.append(f"{entry.name}: {exc}")
